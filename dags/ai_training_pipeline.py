@@ -30,11 +30,17 @@ with DAG(
     default_args=DEFAULT_ARGS,
     tags=["ai-support", "daily"],
     # ------------------------------------------------------------------
-    # TODO (nhiệm vụ 1): hai tham số dưới đây quyết định chuyện gì xảy ra
-    # khi ai đó bấm Clear Task, và khi DAG bị dồn nhiều lần chạy cùng lúc.
-    # Đọc lại triệu chứng ở phiếu #1041 rồi đặt lại cho đúng.
-    catchup=True,
-    # max_active_runs=?
+    # NHIỆM VỤ 1 — hai tham số này chỉ GIẢM TẦN SUẤT kích hoạt lỗi, chúng
+    # không phải root cause (root cause nằm ở config() của model gold).
+    #
+    # catchup=False: Airflow không tự schedule chạy bù mọi ngày kể từ
+    #   start_date. Với catchup=True, một lần bật/clear DAG sinh ra 14 run
+    #   dồn một lúc, mỗi run ghi vào cùng bảng đích.
+    # max_active_runs=1: chỉ một run được ghi vào warehouse tại một thời
+    #   điểm. Hai run song song trên cùng bảng incremental sẽ đọc-ghi
+    #   xen kẽ nhau (race condition), kết quả không xác định.
+    catchup=False,
+    max_active_runs=1,
     # ------------------------------------------------------------------
 ) as dag:
 

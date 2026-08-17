@@ -53,7 +53,9 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    -- primary key là điều kiện để DuckDB chấp nhận mệnh đề ON CONFLICT,
+    -- tức là điều kiện để phép ghi trở nên idempotent.
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -66,13 +68,35 @@ create table if not exists {TABLE} (
 
 
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
-    """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
+    """Ghi một lô message xuống kho — UPSERT theo event_id, idempotent.
 
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
+    at-least-once đảm bảo không mất message, nhưng cái giá là một số lô bị
+    phát lại sau khi khởi động lại. Phép ghi phải hấp thụ được việc phát lại
+    đó: ghi cùng một event_id lần thứ hai phải THAY THẾ hàng cũ, không tạo
+    thêm hàng mới. Ghi N lần cho cùng một kết quả như ghi 1 lần.
+
+    Chọn DO UPDATE, không chọn DO NOTHING: khi một message được phát lại với
+    nội dung ĐÃ ĐỔI (upstream sửa rồi gửi lại cùng event_id), DO UPDATE hội
+    tụ về phiên bản mới nhất, còn DO NOTHING đóng băng vĩnh viễn phiên bản
+    đến trước và âm thầm bỏ bản sửa. Cùng một lý lẽ với `merge` ở nhiệm vụ 1.
+    Với message phát lại y nguyên, hai lựa chọn cho kết quả như nhau.
+
+    Bọc trong một transaction để `kill -9` giữa lô không để lại lô nửa vời:
+    WAL của DuckDB rollback phần chưa commit.
     """
+    con.begin()
     con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
+        f"""
+        insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict (event_id) do update set
+            ticket_id     = excluded.ticket_id,
+            customer_id   = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            event_type    = excluded.event_type,
+            latency_ms    = excluded.latency_ms,
+            event_time    = excluded.event_time,
+            _ingested_at  = excluded._ingested_at
+        """,
         [
             (
                 r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
@@ -81,6 +105,7 @@ def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
             for r in batch
         ],
     )
+    con.commit()
 
 
 def maybe_crash(batch_no: int, crash_at: int | None) -> None:
@@ -109,12 +134,17 @@ def consume(
                 break
             batch_no += 1
 
-            # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
-            # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
-            # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            # ── at-least-once: GHI TRƯỚC, COMMIT OFFSET SAU ───────────────
+            # Offset là lời khẳng định "mọi message tới đây đã xử lý xong".
+            # Lời khẳng định đó chỉ được phép đưa ra SAU khi dữ liệu thật sự
+            # nằm trên đĩa — commit trước là hứa trước khi làm.
+            #
+            # Chết ở maybe_crash(): dữ liệu đã ghi, offset CHƯA dịch. Khởi
+            # động lại đọc lại đúng lô đó -> phát lại, không mất gì. Phát lại
+            # vô hại vì write_batch() upsert theo event_id.
             write_batch(con, batch)           # ghi dữ liệu
+            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            consumer.commit()                 # ghi nhận offset
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)
